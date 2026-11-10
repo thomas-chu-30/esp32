@@ -5,6 +5,7 @@ use embassy_net::{
     dns::DnsSocket,
     tcp::client::{TcpClient, TcpClientState},
 };
+use embassy_time::{Duration, with_timeout};
 use embedded_graphics::{
     mono_font::{
         ascii::{FONT_6X10, FONT_10X20, FONT_9X15_BOLD},
@@ -25,6 +26,8 @@ use reqwless::{
 use crate::{LCD_H, LCD_W};
 
 const TCP_BUF: usize = 1500;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(8);
 pub type WeatherTcpState = TcpClientState<1, TCP_BUF, TCP_BUF>;
 
 pub struct Weather {
@@ -39,11 +42,28 @@ pub async fn fetch(
     url: &str,
     place: &str,
 ) -> Result<Weather, String<48>> {
+    match with_timeout(FETCH_TIMEOUT, fetch_inner(stack, tcp_state, url, place)).await {
+        Ok(result) => result,
+        Err(_) => {
+            info!("weather fetch timed out");
+            Err(err_msg("timeout"))
+        }
+    }
+}
+
+async fn fetch_inner(
+    stack: Stack<'static>,
+    tcp_state: &'static WeatherTcpState,
+    url: &str,
+    place: &str,
+) -> Result<Weather, String<48>> {
     let dns = DnsSocket::new(stack);
-    let tcp = TcpClient::new(stack, tcp_state);
+    let mut tcp = TcpClient::new(stack, tcp_state);
+    tcp.set_timeout(Some(SOCKET_TIMEOUT));
     let mut client = HttpClient::new(&tcp, &dns);
     let mut rx_buf = [0u8; 2048];
 
+    info!("weather dns/connect");
     let request = client
         .request(Method::GET, url)
         .await
@@ -53,8 +73,10 @@ pub async fn fetch(
         ("Accept", "application/json"),
         ("Connection", "close"),
     ]);
+    info!("weather send");
     let response = request.send(&mut rx_buf).await.map_err(http_err("send"))?;
     let status = response.status;
+    info!("weather body, status={status:?}");
     let body = response
         .body()
         .read_to_end()
@@ -85,7 +107,7 @@ where
 
     let meta = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_LIGHT_GRAY);
     let _ = Text::new(ip, Point::new(8, 108), meta).draw(display);
-    let _ = Text::new("refresh 10 min", Point::new(8, 124), meta).draw(display);
+    let _ = Text::new("L page  R refresh", Point::new(8, 124), meta).draw(display);
 }
 
 pub fn draw_status<D>(display: &mut D, title: &str, detail: &str)
@@ -100,6 +122,27 @@ where
     let _ = Text::new(title, Point::new(8, 48), title_style).draw(display);
     let detail_style = MonoTextStyle::new(&FONT_6X10, Rgb565::GREEN);
     let _ = Text::new(detail, Point::new(8, 70), detail_style).draw(display);
+    let meta = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_LIGHT_GRAY);
+    let _ = Text::new("L page  R refresh", Point::new(8, 124), meta).draw(display);
+}
+
+pub fn draw_wifi<D>(display: &mut D, ssid: &str, ip: &str, status: &str)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let _ = Rectangle::new(Point::new(0, 22), Size::new(LCD_W as u32, (LCD_H - 22) as u32))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+        .draw(display);
+
+    let label = MonoTextStyle::new(&FONT_6X10, Rgb565::CSS_LIGHT_GRAY);
+    let value = MonoTextStyle::new(&FONT_9X15_BOLD, Rgb565::CYAN);
+
+    let _ = Text::new("SSID", Point::new(8, 38), label).draw(display);
+    let _ = Text::new(ssid, Point::new(8, 54), value).draw(display);
+    let _ = Text::new("status", Point::new(8, 72), label).draw(display);
+    let _ = Text::new(status, Point::new(8, 88), value).draw(display);
+    let _ = Text::new(ip, Point::new(8, 108), label).draw(display);
+    let _ = Text::new("L page  R refresh", Point::new(8, 124), label).draw(display);
 }
 
 fn parse_open_meteo(body: &str, place: &str) -> Result<Weather, String<48>> {

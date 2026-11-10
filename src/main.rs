@@ -6,6 +6,7 @@ extern crate alloc;
 use core::fmt::Write;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::{Config as NetConfig, Runner, StackResources};
 use embassy_time::{Duration, Timer};
 use embedded_graphics::{
@@ -24,7 +25,7 @@ use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
-    gpio::{Level, Output, OutputConfig},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     ram,
     rng::Rng,
     spi::master::{Config as SpiConfig, Spi},
@@ -43,6 +44,7 @@ use mipidsi::{
     options::{ColorInversion, Orientation, Rotation},
 };
 
+mod buttons;
 mod weather;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -132,7 +134,29 @@ fn truncate_ascii(text: &str) -> &str {
     }
 }
 
-fn draw_header<D>(display: &mut D)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Weather,
+    Wifi,
+}
+
+impl Page {
+    fn toggle(self) -> Self {
+        match self {
+            Self::Weather => Self::Wifi,
+            Self::Wifi => Self::Weather,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Weather => "Weather",
+            Self::Wifi => "Wi-Fi",
+        }
+    }
+}
+
+fn draw_header<D>(display: &mut D, title: &str)
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -141,7 +165,7 @@ where
         .draw(display);
 
     let style = MonoTextStyle::new(&FONT_9X15_BOLD, Rgb565::YELLOW);
-    let _ = Text::new("T-Display WiFi", Point::new(8, 16), style).draw(display);
+    let _ = Text::new(title, Point::new(8, 16), style).draw(display);
 }
 
 fn wifi_auth() -> AuthenticationMethodConfig {
@@ -166,7 +190,13 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(size: 36 * 1024);
 
     // T-Display: MOSI=19, SCLK=18, CS=5, DC=16, RST=23, BL=4
+    // 左鍵 GPIO0（BOOT）、右鍵 GPIO35（僅輸入，板上已上拉）
     let _backlight = Output::new(peripherals.GPIO4, Level::High, output_cfg);
+    let btn_left = Input::new(
+        peripherals.GPIO0,
+        InputConfig::default().with_pull(Pull::Up),
+    );
+    let btn_right = Input::new(peripherals.GPIO35, InputConfig::default());
 
     let spi = Spi::new(
         peripherals.SPI2,
@@ -196,7 +226,7 @@ async fn main(spawner: Spawner) -> ! {
         .unwrap();
 
     let _ = display.clear(Rgb565::BLACK);
-    draw_header(&mut display);
+    draw_header(&mut display, "T-Display WiFi");
 
     let mut lcd_log = LcdLog::new();
     lcd_log.push("LCD ready");
@@ -206,6 +236,8 @@ async fn main(spawner: Spawner) -> ! {
     // Wi-Fi 一定要先開 scheduler，才能 init radio。
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+    spawner.spawn(buttons::watch(btn_left, buttons::Event::TogglePage).unwrap());
+    spawner.spawn(buttons::watch(btn_right, buttons::Event::Refresh).unwrap());
 
     let station_config = if wifi_credentials_set() {
         WifiConfig::Station(
@@ -315,31 +347,112 @@ async fn main(spawner: Spawner) -> ! {
         "http://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}&longitude={WEATHER_LON}&current=temperature_2m,weather_code"
     );
 
-    loop {
-        match stack.config_v4() {
-            None => {
-                info!("Wi-Fi / DHCP 斷線，等待重連");
-                weather::draw_status(&mut display, "offline", "waiting wifi");
-                Timer::after(Duration::from_secs(5)).await;
-            }
-            Some(v4) => {
-                let mut ip_line: String<LINE_CAP> = String::new();
-                let _ = write!(ip_line, "IP {}", v4.address);
-                weather::draw_status(&mut display, "weather", "fetching...");
-                info!("抓取天氣 {WEATHER_CITY} {weather_url}");
+    let mut page = Page::Weather;
+    let mut last_weather: Option<weather::Weather> = None;
+    let mut last_error: Option<String<48>> = None;
+    let mut fetch_now = true;
 
-                match weather::fetch(stack, tcp_state, &weather_url, WEATHER_CITY).await {
-                    Ok(wx) => {
-                        info!("{} {} {}", wx.place, wx.temp_c, wx.condition);
-                        weather::draw(&mut display, &wx, &ip_line);
+    loop {
+        let online = stack.config_v4();
+        let mut ip_line: String<LINE_CAP> = String::new();
+        let wifi_status = match &online {
+            Some(v4) => {
+                let _ = write!(ip_line, "IP {}", v4.address);
+                "online"
+            }
+            None => {
+                let _ = ip_line.push_str("IP --");
+                "offline"
+            }
+        };
+
+        if fetch_now {
+            match &online {
+                None => {
+                    info!("Wi-Fi / DHCP 斷線，等待重連");
+                    fetch_now = false;
+                }
+                Some(_) => {
+                    if page == Page::Weather {
+                        draw_header(&mut display, page.title());
+                        weather::draw_status(&mut display, "weather", "fetching...");
                     }
-                    Err(err) => {
-                        info!("抓天氣失敗: {err}");
-                        weather::draw_status(&mut display, "wx failed", &err);
+                    info!("抓取天氣 {WEATHER_CITY} {weather_url}");
+                    match select(
+                        weather::fetch(stack, tcp_state, &weather_url, WEATHER_CITY),
+                        buttons::EVENTS.receive(),
+                    )
+                    .await
+                    {
+                        Either::First(Ok(wx)) => {
+                            info!("{} {} {}", wx.place, wx.temp_c, wx.condition);
+                            last_weather = Some(wx);
+                            last_error = None;
+                            fetch_now = false;
+                        }
+                        Either::First(Err(err)) => {
+                            info!("抓天氣失敗: {err}");
+                            last_error = Some(err);
+                            fetch_now = false;
+                        }
+                        Either::Second(buttons::Event::TogglePage) => {
+                            page = page.toggle();
+                            fetch_now = false;
+                            info!("抓天氣取消，切到 {}", page.title());
+                        }
+                        Either::Second(buttons::Event::Refresh) => {
+                            info!("抓取中又按刷新，重試");
+                        }
                     }
                 }
+            }
+            for _ in 0..buttons::drain_toggles() {
+                page = page.toggle();
+            }
+        }
 
-                Timer::after(Duration::from_secs(600)).await;
+        draw_header(&mut display, page.title());
+        match page {
+            Page::Weather => match last_weather.as_ref() {
+                Some(wx) => weather::draw(&mut display, wx, &ip_line),
+                None => {
+                    if let Some(err) = last_error.as_ref() {
+                        weather::draw_status(&mut display, "wx failed", err);
+                    } else if online.is_none() {
+                        weather::draw_status(&mut display, "offline", "waiting wifi");
+                    } else {
+                        weather::draw_status(&mut display, "weather", "no data");
+                    }
+                }
+            },
+            Page::Wifi => {
+                let ssid = if wifi_credentials_set() {
+                    WIFI_SSID
+                } else {
+                    "(unset)"
+                };
+                weather::draw_wifi(&mut display, ssid, &ip_line, wifi_status);
+            }
+        }
+
+        let idle = if online.is_some() {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_secs(5)
+        };
+        match buttons::wait(idle).await {
+            Some(buttons::Event::Refresh) => {
+                info!("右鍵：刷新天氣");
+                page = Page::Weather;
+                fetch_now = true;
+            }
+            Some(buttons::Event::TogglePage) => {
+                page = page.toggle();
+                info!("左鍵：切到 {}", page.title());
+            }
+            None => {
+                info!("定期刷新天氣");
+                fetch_now = true;
             }
         }
     }
