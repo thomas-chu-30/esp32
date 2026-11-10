@@ -1,6 +1,13 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::fmt::Write;
+
+use embassy_executor::Spawner;
+use embassy_net::{Config as NetConfig, Runner, StackResources};
+use embassy_time::{Duration, Timer};
 use embedded_graphics::{
     mono_font::{
         ascii::{FONT_6X10, FONT_9X15_BOLD},
@@ -12,14 +19,21 @@ use embedded_graphics::{
     text::Text,
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
+use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
     gpio::{Level, Output, OutputConfig},
-    main,
+    ram,
+    rng::Rng,
     spi::master::{Config as SpiConfig, Spi},
     time::Rate,
+    timer::timg::TimerGroup,
+};
+use esp_radio::wifi::{
+    AuthenticationMethodConfig, Config as WifiConfig, ControllerConfig, Interface, WifiController,
+    scan::ScanConfig, sta::StationConfig,
 };
 use heapless::String;
 use log::info;
@@ -29,13 +43,33 @@ use mipidsi::{
     options::{ColorInversion, Orientation, Rotation},
 };
 
+mod weather;
+
 esp_bootloader_esp_idf::esp_app_desc!();
+
+/// 來自 `wifi.env` 或環境變數 `WIFI_SSID` / `WIFI_PASSWORD`（由 build.rs 寫入 OUT_DIR）。
+const WIFI_SSID: &str = include_str!(concat!(env!("OUT_DIR"), "/wifi_ssid.txt"));
+const WIFI_PASSWORD: &str = include_str!(concat!(env!("OUT_DIR"), "/wifi_password.txt"));
+const WEATHER_CITY: &str = include_str!(concat!(env!("OUT_DIR"), "/weather_city.txt"));
+const WEATHER_LAT: &str = include_str!(concat!(env!("OUT_DIR"), "/weather_lat.txt"));
+const WEATHER_LON: &str = include_str!(concat!(env!("OUT_DIR"), "/weather_lon.txt"));
+
+fn wifi_credentials_set() -> bool {
+    !matches!(WIFI_SSID, "" | "YOUR_SSID")
+}
 
 /// LILYGO TTGO T-Display 1.14" ST7789（橫向 240×135）
 const LCD_W: i32 = 240;
 const LCD_H: i32 = 135;
 const VISIBLE_LINES: usize = 9;
 const LINE_CAP: usize = 40;
+
+macro_rules! mk_static {
+    ($t:ty, $val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        STATIC_CELL.uninit().write(($val))
+    }};
+}
 
 struct LcdLog {
     lines: [String<LINE_CAP>; VISIBLE_LINES],
@@ -59,6 +93,12 @@ impl LcdLog {
         if self.filled < VISIBLE_LINES {
             self.filled += 1;
         }
+    }
+
+    fn push_fmt(&mut self, args: core::fmt::Arguments<'_>) {
+        let mut line: String<LINE_CAP> = String::new();
+        let _ = line.write_fmt(args);
+        self.push(&line);
     }
 
     fn draw<D>(&self, display: &mut D)
@@ -101,17 +141,29 @@ where
         .draw(display);
 
     let style = MonoTextStyle::new(&FONT_9X15_BOLD, Rgb565::YELLOW);
-    let _ = Text::new("T-Display LOG", Point::new(8, 16), style).draw(display);
+    let _ = Text::new("T-Display WiFi", Point::new(8, 16), style).draw(display);
 }
 
-#[main]
-fn main() -> ! {
+fn wifi_auth() -> AuthenticationMethodConfig {
+    if WIFI_PASSWORD.is_empty() {
+        AuthenticationMethodConfig::Open
+    } else {
+        AuthenticationMethodConfig::Wpa2Personal(WIFI_PASSWORD.try_into().unwrap())
+    }
+}
+
+#[esp_hal::main]
+async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     let mut delay = Delay::new();
     let output_cfg = OutputConfig::default();
+
+    // Wi-Fi 韌體需要 heap。ESP32 還要把一部分放回被回收的 DRAM。
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 36 * 1024);
 
     // T-Display: MOSI=19, SCLK=18, CS=5, DC=16, RST=23, BL=4
     let _backlight = Output::new(peripherals.GPIO4, Level::High, output_cfg);
@@ -148,20 +200,170 @@ fn main() -> ! {
 
     let mut lcd_log = LcdLog::new();
     lcd_log.push("LCD ready");
-    lcd_log.push("USB monitor still works");
+    lcd_log.push("starting radio...");
     lcd_log.draw(&mut display);
 
-    info!("LCD 已啟動，log 會同時出現在螢幕與 USB monitor");
+    // Wi-Fi 一定要先開 scheduler，才能 init radio。
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
+    let station_config = if wifi_credentials_set() {
+        WifiConfig::Station(
+            StationConfig::default()
+                .with_ssid(WIFI_SSID.try_into().unwrap())
+                .with_authentication(wifi_auth()),
+        )
+    } else {
+        WifiConfig::Station(StationConfig::default())
+    };
+
+    lcd_log.push("wifi init");
+    lcd_log.draw(&mut display);
+
+    let wifi_interface = Interface::station();
+    let mut controller = WifiController::new(
+        peripherals.WIFI,
+        ControllerConfig::default().with_initial_config(station_config),
+    )
+    .expect("wifi init failed");
+
+    lcd_log.push("scanning...");
+    lcd_log.draw(&mut display);
+    info!("開始掃描 Wi-Fi");
+
+    let scan_config = ScanConfig::default().with_max(12);
+    match controller.scan_async(&scan_config).await {
+        Ok(mut aps) => {
+            aps.sort_by(|a, b| b.signal_strength.cmp(&a.signal_strength));
+            info!("掃到 {} 個 AP", aps.len());
+            lcd_log.push_fmt(format_args!("found {} AP", aps.len()));
+
+            let mut target_seen = false;
+            for ap in aps.iter().take(VISIBLE_LINES.saturating_sub(2)) {
+                let name = if ap.ssid.is_empty() {
+                    "<hidden>"
+                } else {
+                    ap.ssid.as_str()
+                };
+                if name == WIFI_SSID {
+                    target_seen = true;
+                }
+                lcd_log.push_fmt(format_args!("{:>3} {}", ap.signal_strength, name));
+                info!(
+                    "AP ssid={:?} rssi={} ch={}",
+                    name, ap.signal_strength, ap.channel
+                );
+            }
+
+            if !wifi_credentials_set() {
+                lcd_log.push("edit wifi.env to connect");
+            } else if target_seen {
+                lcd_log.push_fmt(format_args!("saw {WIFI_SSID}"));
+            } else {
+                lcd_log.push_fmt(format_args!("no {WIFI_SSID}"));
+            }
+        }
+        Err(err) => {
+            info!("掃描失敗: {err:?}");
+            lcd_log.push("scan failed");
+        }
+    }
+    lcd_log.draw(&mut display);
+
+    let net_config = NetConfig::dhcpv4(Default::default());
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+    let (stack, runner) = embassy_net::new(
+        wifi_interface,
+        net_config,
+        mk_static!(StackResources<5>, StackResources::<5>::new()),
+        seed,
+    );
+
+    spawner.spawn(net_task(runner).unwrap());
+
+    if !wifi_credentials_set() {
+        lcd_log.push("scan-only mode");
+        lcd_log.draw(&mut display);
+        info!("尚未設定 SSID，只掃描不連線。請改 wifi.env 或設 WIFI_SSID");
+        loop {
+            Timer::after(Duration::from_secs(5)).await;
+        }
+    }
+
+    spawner.spawn(connection_task(controller).unwrap());
+
+    lcd_log.push("connecting...");
+    lcd_log.draw(&mut display);
+    info!("等待連上 {WIFI_SSID} 並取得 DHCP");
 
     loop {
-        lcd_log.push("LED ON");
-        lcd_log.draw(&mut display);
-        info!("LED 亮起");
-        delay.delay_millis(1000);
-
-        lcd_log.push("LED OFF");
-        lcd_log.draw(&mut display);
-        info!("LED 熄滅");
-        delay.delay_millis(1000);
+        if let Some(v4) = stack.config_v4() {
+            lcd_log.push("connected");
+            lcd_log.push_fmt(format_args!("IP {}", v4.address));
+            lcd_log.draw(&mut display);
+            info!("已連上，IP = {}", v4.address);
+            break;
+        }
+        Timer::after(Duration::from_secs(1)).await;
     }
+
+    let tcp_state = mk_static!(weather::WeatherTcpState, weather::WeatherTcpState::new());
+    let mut weather_url: String<192> = String::new();
+    let _ = write!(
+        weather_url,
+        "http://api.open-meteo.com/v1/forecast?latitude={WEATHER_LAT}&longitude={WEATHER_LON}&current=temperature_2m,weather_code"
+    );
+
+    loop {
+        match stack.config_v4() {
+            None => {
+                info!("Wi-Fi / DHCP 斷線，等待重連");
+                weather::draw_status(&mut display, "offline", "waiting wifi");
+                Timer::after(Duration::from_secs(5)).await;
+            }
+            Some(v4) => {
+                let mut ip_line: String<LINE_CAP> = String::new();
+                let _ = write!(ip_line, "IP {}", v4.address);
+                weather::draw_status(&mut display, "weather", "fetching...");
+                info!("抓取天氣 {WEATHER_CITY} {weather_url}");
+
+                match weather::fetch(stack, tcp_state, &weather_url, WEATHER_CITY).await {
+                    Ok(wx) => {
+                        info!("{} {} {}", wx.place, wx.temp_c, wx.condition);
+                        weather::draw(&mut display, &wx, &ip_line);
+                    }
+                    Err(err) => {
+                        info!("抓天氣失敗: {err}");
+                        weather::draw_status(&mut display, "wx failed", &err);
+                    }
+                }
+
+                Timer::after(Duration::from_secs(600)).await;
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn connection_task(mut controller: WifiController<'static>) {
+    loop {
+        info!("嘗試連線到 {WIFI_SSID}");
+        match controller.connect_async().await {
+            Ok(info) => {
+                info!("Wi-Fi 已關聯: {info:?}");
+                let _ = controller.wait_for_disconnect_async().await;
+                info!("Wi-Fi 已斷線，5 秒後重連");
+            }
+            Err(err) => {
+                info!("連線失敗: {err:?}");
+            }
+        }
+        Timer::after(Duration::from_secs(5)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface>) {
+    runner.run().await
 }
