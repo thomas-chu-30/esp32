@@ -1,0 +1,36 @@
+[package]
+name = "my-esp32"
+version = "0.1.0"
+authors = ["thomas <coreisdontgu@gmail.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+esp-backtrace = { version = "0.20.0", features = [
+    "esp32",
+    "panic-handler",
+    "println",
+] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32", "log-04"] }
+esp-hal = { version = "1.2.2", features = ["esp32", "log-04", "unstable"] }
+esp-println = { version = "0.18.0", features = ["esp32", "log-04"] }
+log = "0.4.27"
+
+embedded-graphics = "0.8"
+embedded-hal-bus = "0.3"
+heapless = "0.8"
+mipidsi = "0.10"
+
+[profile.dev]
+# Rust debug is too slow.
+# For debug builds always builds with some optimization
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1 # LLVM can perform better optimizations using a single thread
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false
